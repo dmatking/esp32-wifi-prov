@@ -16,13 +16,35 @@
 extern "C" {
 #endif
 
+// One choice in a dropdown field.
+typedef struct {
+    const char *label;   // displayed text
+    const char *value;   // submitted value
+} wifi_prov_option_t;
+
 // Describes one extra form field beyond SSID/password.
 // The key is used as both the HTML input name and the NVS key.
+//
+// Rendering rules (checked in order):
+//   options != NULL              → <select> dropdown
+//   input_type != NULL           → <input type=input_type min max>
+//   secret == true               → <input type="password">
+//   otherwise                    → <input type="text">
 typedef struct {
     const char *key;          // NVS key (max 15 chars)
     const char *label;        // HTML label text
-    const char *placeholder;  // HTML placeholder, NULL = none
-    bool        secret;       // render as type="password"
+    const char *placeholder;  // HTML placeholder or default value, NULL = none
+
+    bool        secret;       // render as type="password" (text fields only)
+
+    // Dropdown — if set, renders a <select> and ignores secret/input_type.
+    const wifi_prov_option_t *options;
+    int                       option_count;
+
+    // Number / custom input type — ignored when options is set.
+    const char *input_type;   // e.g. "number"; NULL = "text"
+    const char *input_min;    // HTML min attribute, NULL = omit
+    const char *input_max;    // HTML max attribute, NULL = omit
 } wifi_prov_field_t;
 
 // Called when the provisioning portal starts (device can update its display).
@@ -41,11 +63,22 @@ typedef struct {
 
     // Called just before the portal becomes active.  NULL = no callback.
     wifi_prov_display_fn_t on_portal;
+
+    // Called when a connection attempt fails, before the portal restarts.
+    // ap_ssid is the SoftAP name the user should reconnect to.  NULL = no callback.
+    wifi_prov_display_fn_t on_connect_failed;
+
     void                  *on_portal_ctx;
 
     // Optional extra fields appended to the provisioning form.
     const wifi_prov_field_t *extra_fields;
     int                      extra_count;
+
+    // If true, skip the stored-credential fast path and go straight to the
+    // captive portal.  Saved values are preserved (non-secret fields
+    // pre-populate the form).  Used to recover from app-level auth failures
+    // without wiping WiFi creds.
+    bool force_portal;
 } wifi_prov_config_t;
 
 // Connect to WiFi using stored credentials, or run the captive-portal

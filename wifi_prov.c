@@ -29,6 +29,8 @@
 static EventGroupHandle_t        s_eg;
 static int                       s_retry;
 static const wifi_prov_config_t *s_cfg;
+static bool                      s_force_portal;
+static bool                      s_connect_failed;
 
 // --- URL decode -------------------------------------------------------
 
@@ -99,15 +101,16 @@ static bool sta_connect(const char *ssid, const char *pass)
     s_retry = 0;
     xEventGroupClearBits(s_eg, CONNECTED_BIT | FAIL_BIT);
 
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
 
+    esp_event_handler_instance_t inst_any, inst_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, sta_event_handler, NULL, NULL));
+        WIFI_EVENT, ESP_EVENT_ANY_ID, sta_event_handler, NULL, &inst_any));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, sta_event_handler, NULL, NULL));
+        IP_EVENT, IP_EVENT_STA_GOT_IP, sta_event_handler, NULL, &inst_got_ip));
 
     wifi_config_t wcfg = { 0 };
     strncpy((char *)wcfg.sta.ssid,     ssid, sizeof(wcfg.sta.ssid) - 1);
@@ -126,7 +129,13 @@ static bool sta_connect(const char *ssid, const char *pass)
 
     if (bits & CONNECTED_BIT) return true;
 
+    // Clean up so the portal can reinitialize WiFi for another attempt
     ESP_LOGE(TAG, "Failed to connect to '%s'", ssid);
+    esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, inst_any);
+    esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, inst_got_ip);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_netif_destroy_default_wifi(sta_netif);
     return false;
 }
 
@@ -134,9 +143,24 @@ static bool sta_connect(const char *ssid, const char *pass)
 
 static esp_err_t handle_form_get(httpd_req_t *req)
 {
-    const size_t BUF = 4096;
+    const size_t BUF = 8192;
     char *html = malloc(BUF);
     if (!html) return ESP_ERR_NO_MEM;
+
+    // Pre-populate SSID from NVS (password intentionally left blank)
+    char saved_ssid[64] = { 0 };
+    nvs_handle_t nvs_r;
+    if (nvs_open(NVS_NS, NVS_READONLY, &nvs_r) == ESP_OK) {
+        size_t len = sizeof(saved_ssid);
+        nvs_get_str(nvs_r, "ssid", saved_ssid, &len);
+        nvs_close(nvs_r);
+    }
+
+    const char *err_banner = s_connect_failed
+        ? "<p style='color:#c00;background:#fee;padding:8px;border-radius:4px'>"
+          "&#9888; Connection failed &mdash; check your WiFi password and try again."
+          "</p>"
+        : "";
 
     int n = snprintf(html, BUF,
         "<!DOCTYPE html><html><head><title>Device Setup</title>"
@@ -144,30 +168,76 @@ static esp_err_t handle_form_get(httpd_req_t *req)
         "<style>"
         "body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px}"
         "label{display:block;margin:12px 0 4px}"
-        "input{width:100%%;padding:8px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}"
+        "input,select{width:100%%;padding:8px;box-sizing:border-box;"
+        "border:1px solid #ccc;border-radius:4px;font-size:15px}"
         "button{margin-top:24px;width:100%%;padding:12px;background:#0070f3;"
         "color:#fff;border:none;border-radius:4px;font-size:16px;cursor:pointer}"
         "</style></head><body>"
         "<h2>Device Setup</h2>"
+        "%s"
         "<p>Enter your WiFi credentials to connect this device to your network.</p>"
         "<form method='POST' action='/save'>"
         "<label>WiFi Network (SSID)</label>"
-        "<input name='ssid' autocomplete='off' placeholder='Network name'>"
+        "<input name='ssid' autocomplete='off' placeholder='Network name' value='%s'>"
         "<label>WiFi Password</label>"
-        "<input type='password' name='pass' placeholder='Password (leave blank if open)'>");
+        "<input type='password' name='pass' placeholder='%s'>",
+        err_banner,
+        saved_ssid,
+        saved_ssid[0] ? "Leave blank to keep current password" : "Password (leave blank if open)");
 
     if (s_cfg && s_cfg->extra_fields) {
+        bool nvs_ok = (nvs_open(NVS_NS, NVS_READONLY, &nvs_r) == ESP_OK);
+
         for (int i = 0; i < s_cfg->extra_count; i++) {
             const wifi_prov_field_t *f = &s_cfg->extra_fields[i];
-            if (BUF - n < 256) break;
-            n += snprintf(html + n, BUF - n,
-                "<label>%s</label>"
-                "<input %s name='%s' placeholder='%s'>",
-                f->label,
-                f->secret ? "type='password' " : "",
-                f->key,
-                f->placeholder ? f->placeholder : "");
+            if (BUF - n < 512) break;
+
+            // Read saved value for non-secret fields
+            char saved_val[256] = { 0 };
+            if (nvs_ok && !f->secret) {
+                size_t vlen = sizeof(saved_val);
+                nvs_get_str(nvs_r, f->key, saved_val, &vlen);
+            }
+
+            if (f->options && f->option_count > 0) {
+                n += snprintf(html + n, BUF - n,
+                    "<label>%s</label><select name='%s'>",
+                    f->label, f->key);
+                for (int j = 0; j < f->option_count && BUF - n > 128; j++) {
+                    bool sel = saved_val[0] &&
+                               strcmp(saved_val, f->options[j].value) == 0;
+                    n += snprintf(html + n, BUF - n,
+                        "<option value='%s'%s>%s</option>",
+                        f->options[j].value, sel ? " selected" : "",
+                        f->options[j].label);
+                }
+                n += snprintf(html + n, BUF - n, "</select>");
+            } else if (f->input_type) {
+                char min_attr[24] = "", max_attr[24] = "";
+                if (f->input_min) snprintf(min_attr, sizeof(min_attr), " min='%s'", f->input_min);
+                if (f->input_max) snprintf(max_attr, sizeof(max_attr), " max='%s'", f->input_max);
+                n += snprintf(html + n, BUF - n,
+                    "<label>%s</label>"
+                    "<input type='%s'%s%s name='%s' placeholder='%s' value='%s'>",
+                    f->label, f->input_type, min_attr, max_attr,
+                    f->key, f->placeholder ? f->placeholder : "",
+                    saved_val);
+            } else if (f->secret) {
+                n += snprintf(html + n, BUF - n,
+                    "<label>%s</label>"
+                    "<input type='password' name='%s' placeholder='%s'>",
+                    f->label, f->key,
+                    f->placeholder ? f->placeholder : "");
+            } else {
+                n += snprintf(html + n, BUF - n,
+                    "<label>%s</label>"
+                    "<input name='%s' placeholder='%s' value='%s'>",
+                    f->label, f->key,
+                    f->placeholder ? f->placeholder : "",
+                    saved_val);
+            }
         }
+        if (nvs_ok) nvs_close(nvs_r);
     }
 
     n += snprintf(html + n, BUF - n,
@@ -209,7 +279,7 @@ static esp_err_t handle_form_post(httpd_req_t *req)
     nvs_handle_t nvs;
     if (nvs_open(NVS_NS, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_str(nvs, "ssid", ssid);
-        nvs_set_str(nvs, "pass", pass);
+        if (pass[0]) nvs_set_str(nvs, "pass", pass);
 
         if (s_cfg && s_cfg->extra_fields) {
             for (int i = 0; i < s_cfg->extra_count; i++) {
@@ -241,6 +311,8 @@ static esp_err_t handle_form_post(httpd_req_t *req)
 
 static void run_portal(void)
 {
+    xEventGroupClearBits(s_eg, SAVED_BIT);  // clear any stale bit from a previous run
+
     const char *ap_ssid = (s_cfg && s_cfg->ap_ssid) ? s_cfg->ap_ssid : "ESP32-Config";
     const char *ap_pass = s_cfg ? s_cfg->ap_password : NULL;
 
@@ -332,13 +404,17 @@ bool wifi_prov_start(const wifi_prov_config_t *cfg)
         };
         gpio_config(&gc);
         if (gpio_get_level(boot_gpio) == 0) {
-            ESP_LOGI(TAG, "Boot GPIO held — waiting 3 s to confirm wipe...");
+            ESP_LOGI(TAG, "Boot GPIO held — waiting 3 s to confirm re-provision...");
             vTaskDelay(pdMS_TO_TICKS(3000));
             if (gpio_get_level(boot_gpio) == 0) {
-                ESP_LOGI(TAG, "Wiping credentials");
-                wifi_prov_reset();
+                ESP_LOGI(TAG, "Forcing provisioning portal (settings preserved)");
+                s_force_portal = true;
             }
         }
+    }
+    if (cfg && cfg->force_portal) {
+        ESP_LOGI(TAG, "force_portal requested by caller");
+        s_force_portal = true;
     }
 
     // Try to load stored credentials
@@ -352,26 +428,37 @@ bool wifi_prov_start(const wifi_prov_config_t *cfg)
         nvs_close(nvs);
     }
 
-    if (ssid[0]) {
+    const char *ap_ssid = (cfg && cfg->ap_ssid) ? cfg->ap_ssid : "ESP32-Config";
+
+    if (ssid[0] && !s_force_portal) {
         ESP_LOGI(TAG, "Stored SSID found: '%s'", ssid);
-        return sta_connect(ssid, pass);
+        if (sta_connect(ssid, pass)) return true;
+        ESP_LOGW(TAG, "Stored credentials failed — falling back to portal");
+        s_connect_failed = true;
+        if (s_cfg && s_cfg->on_connect_failed)
+            s_cfg->on_connect_failed(ap_ssid, s_cfg->on_portal_ctx);
     }
 
-    // No credentials — provisioning portal
-    ESP_LOGI(TAG, "No credentials found — starting provisioning portal");
-    run_portal();
+    // Portal loop: show form, try connect, retry if failed
+    while (1) {
+        ESP_LOGI(TAG, "Starting provisioning portal");
+        run_portal();
 
-    // Re-read credentials saved by portal
-    memset(ssid, 0, sizeof(ssid));
-    memset(pass, 0, sizeof(pass));
-    if (nvs_open(NVS_NS, NVS_READONLY, &nvs) == ESP_OK) {
-        size_t slen = sizeof(ssid), plen = sizeof(pass);
-        nvs_get_str(nvs, "ssid", ssid, &slen);
-        nvs_get_str(nvs, "pass", pass, &plen);
-        nvs_close(nvs);
+        memset(ssid, 0, sizeof(ssid));
+        memset(pass, 0, sizeof(pass));
+        if (nvs_open(NVS_NS, NVS_READONLY, &nvs) == ESP_OK) {
+            size_t slen = sizeof(ssid), plen = sizeof(pass);
+            nvs_get_str(nvs, "ssid", ssid, &slen);
+            nvs_get_str(nvs, "pass", pass, &plen);
+            nvs_close(nvs);
+        }
+
+        if (sta_connect(ssid, pass)) return true;
+        ESP_LOGW(TAG, "Connection failed — re-opening portal for another attempt");
+        s_connect_failed = true;
+        if (s_cfg && s_cfg->on_connect_failed)
+            s_cfg->on_connect_failed(ap_ssid, s_cfg->on_portal_ctx);
     }
-
-    return sta_connect(ssid, pass);
 }
 
 bool wifi_prov_get(const char *key, char *buf, size_t len)

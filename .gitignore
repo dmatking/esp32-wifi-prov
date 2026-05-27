@@ -6,3 +6,5 @@ sdkconfig.old
 *.bin
 *.elf
 *.map
+
+.claude/

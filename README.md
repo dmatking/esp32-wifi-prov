@@ -13,11 +13,13 @@ Supports all major ESP32 variants (ESP32, S2, S3, C3, C6, H2, P4). Requires ESP-
 - `force_portal` flag: jump straight to the portal without wiping stored data (for app-level auth recovery)
 - Boot GPIO: hold a GPIO for 3 s at boot to force re-provisioning (credentials preserved)
 - `on_portal` / `on_connect_failed` callbacks for display/UI updates
+- `device_settings`: background GPIO monitor — 3-second hold at any time fires a user callback
 
 ## Repository layout
 
 ```
 wifi_prov.c / wifi_prov.h          — provisioning component
+device_settings.c / device_settings.h — background button monitor
 CMakeLists.txt
 idf_component.yml
 nordesems__esp-captive-portal/     — captive portal sub-component (bundled, v1.3.0)
@@ -119,6 +121,45 @@ Erases all credentials from NVS, forcing the provisioning portal on the next boo
 ## `force_portal`
 
 Setting `cfg.force_portal = true` sends the device straight to the portal without erasing NVS. Non-secret fields are pre-populated from saved values. Useful when an app-level authentication failure (e.g. an expired API token) needs re-entry without making the user re-enter their WiFi password.
+
+## `device_settings`
+
+A background GPIO monitor that fires a callback after a 3-second button hold, at any point during normal operation. Useful for re-entering the provisioning portal, showing a settings menu, or triggering a factory reset — whatever the app needs.
+
+```c
+#include "device_settings.h"
+#include "wifi_prov.h"
+
+static wifi_prov_config_t s_cfg = { /* ... */ };
+
+static void enter_settings(void)
+{
+    // force_portal=true re-enters the portal without erasing NVS credentials
+    s_cfg.force_portal = true;
+    wifi_prov_start(&s_cfg);
+    s_cfg.force_portal = false;
+}
+
+void app_main(void)
+{
+    wifi_prov_start(&s_cfg);
+
+    // Watch GPIO0 (boot button); fire enter_settings on any 3-second hold
+    device_settings_start(0, enter_settings);
+
+    // ... rest of app
+}
+```
+
+The callback runs inside the monitor task and may block. After the callback returns, the monitor waits 3 seconds before watching for another press (to avoid immediate re-triggering while the button is still held).
+
+### `device_settings_start()`
+
+```c
+void device_settings_start(int gpio_num, device_settings_cb_t on_hold);
+```
+
+Configures `gpio_num` as input with internal pull-up and spawns a low-priority background task. Call once after `wifi_prov_start()`.
 
 ## License
 

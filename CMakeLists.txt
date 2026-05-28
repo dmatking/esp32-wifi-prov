@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "wifi_prov.c"
+    SRCS "wifi_prov.c" "device_settings.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

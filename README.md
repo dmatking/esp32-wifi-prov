@@ -126,6 +126,12 @@ Setting `cfg.force_portal = true` sends the device straight to the portal withou
 
 A background GPIO monitor that fires a callback after a 3-second button hold, at any point during normal operation. Useful for re-entering the provisioning portal, showing a settings menu, or triggering a factory reset — whatever the app needs.
 
+The callback runs inside the monitor task and may block. After it returns the monitor waits 3 seconds before watching for another press.
+
+### Simple apps — call `wifi_prov_start()` in-place
+
+For apps where re-entering the portal is safe to do mid-run (no conflicting network tasks):
+
 ```c
 #include "device_settings.h"
 #include "wifi_prov.h"
@@ -134,24 +140,56 @@ static wifi_prov_config_t s_cfg = { /* ... */ };
 
 static void enter_settings(void)
 {
-    // force_portal=true re-enters the portal without erasing NVS credentials
     s_cfg.force_portal = true;
-    wifi_prov_start(&s_cfg);
+    wifi_prov_start(&s_cfg);   // blocks until portal completes
     s_cfg.force_portal = false;
 }
 
 void app_main(void)
 {
     wifi_prov_start(&s_cfg);
-
-    // Watch GPIO0 (boot button); fire enter_settings on any 3-second hold
     device_settings_start(0, enter_settings);
-
     // ... rest of app
 }
 ```
 
-The callback runs inside the monitor task and may block. After the callback returns, the monitor waits 3 seconds before watching for another press (to avoid immediate re-triggering while the button is still held).
+### Apps with active network connections — restart into the portal
+
+For apps with background tasks using the network (HTTP fetches, MQTT, etc.), calling `wifi_prov_start()` in-place can race with those tasks. The cleaner approach is to write a flag to NVS and restart:
+
+```c
+static void enter_settings(void)
+{
+    // Write a flag so the next boot opens the portal
+    nvs_handle_t nvs;
+    if (nvs_open("app", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, "force_portal", 1);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    esp_restart();
+}
+
+void app_main(void)
+{
+    // Read and clear the flag before wifi_prov_start()
+    nvs_flash_init();   // must be called before reading NVS
+    uint8_t force = 0;
+    nvs_handle_t nvs;
+    if (nvs_open("app", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_get_u8(nvs, "force_portal", &force);
+        if (force) { nvs_erase_key(nvs, "force_portal"); nvs_commit(nvs); }
+        nvs_close(nvs);
+    }
+
+    s_cfg.force_portal = (force != 0);
+    wifi_prov_start(&s_cfg);
+    device_settings_start(0, enter_settings);
+    // ... rest of app
+}
+```
+
+> **Note:** `nvs_flash_init()` must be called explicitly before any `nvs_open()` that happens before `wifi_prov_start()`. `wifi_prov_start()` calls it internally, but only after your early NVS reads have already run.
 
 ### `device_settings_start()`
 
@@ -159,7 +197,7 @@ The callback runs inside the monitor task and may block. After the callback retu
 void device_settings_start(int gpio_num, device_settings_cb_t on_hold);
 ```
 
-Configures `gpio_num` as input with internal pull-up and spawns a low-priority background task. Call once after `wifi_prov_start()`.
+Configures `gpio_num` as input with internal pull-up and spawns a low-priority background task (2 KB stack). Call once after `wifi_prov_start()`.
 
 ## License
 

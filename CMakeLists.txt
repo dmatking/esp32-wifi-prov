@@ -7,7 +7,7 @@ idf_component_register(
         esp_netif
         esp_http_server
         nvs_flash
-        driver
+        esp_driver_gpio
         log
         freertos
     PRIV_REQUIRES

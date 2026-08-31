@@ -261,9 +261,18 @@ static esp_err_t handle_form_post(httpd_req_t *req)
     char *body = malloc(len + 1);
     if (!body) return ESP_ERR_NO_MEM;
 
-    int recv = httpd_req_recv(req, body, len);
-    if (recv <= 0) { free(body); return ESP_FAIL; }
-    body[recv] = '\0';
+    // Loop: httpd_req_recv() returns what one read produced, not the whole
+    // body. A form arriving in two TCP segments -- easily a long password,
+    // or any client that splits -- would otherwise be parsed and persisted
+    // half-complete, silently storing a truncated credential.
+    int got = 0;
+    while (got < (int)len) {
+        int recv = httpd_req_recv(req, body + got, len - got);
+        if (recv == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (recv <= 0) { free(body); return ESP_FAIL; }
+        got += recv;
+    }
+    body[got] = '\0';
 
     char ssid[64] = { 0 };
     char pass[128] = { 0 };
